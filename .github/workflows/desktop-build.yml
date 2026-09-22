@@ -39,16 +39,16 @@ jobs:
       DESKTOP_ONLY: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
+      # 版本不要显式指定：pnpm/action-setup 会自动读取 package.json 的 packageManager 字段；
+      # 若同时传 with.version，会因「重复指定版本」直接报错
+      # （注意 packageManager 带 +sha512 后缀，即便数值一致也会被判定为冲突）。
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          # 与 root package.json 的 packageManager 字段保持一致
-          version: 10.34.5
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -99,7 +99,7 @@ jobs:
           printf '%s\n' "${exes[@]}"
 
       - name: Upload artifacts (backup)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: desktop-windows-${{ steps.tag.outputs.tag }}
           path: |
