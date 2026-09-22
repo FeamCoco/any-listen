@@ -1,0 +1,123 @@
+name: Desktop Build
+
+# 说明：
+# 本工作流用于在 fork / 自定义环境中真正编译并发布桌面端 Windows 安装包。
+# 仓库原有的 release.yml 只做「源码同步」，且依赖 fork 中不存在的 secrets，也不产出安装包。
+#
+# 触发方式刻意与 release.yml 区分，避免误触发：
+#   - 手动触发（workflow_dispatch），可指定 tag 名（默认 desktop-test-v0.9.0-beta.11）
+#   - 推送 desktop-test-v* tag
+# 不使用 desktop-v* / webserver-v* 前缀。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布使用的 tag（留空则使用默认 desktop-test-v0.9.0-beta.11）'
+        required: false
+        default: 'desktop-test-v0.9.0-beta.11'
+  push:
+    tags:
+      - 'desktop-test-v*'
+
+# 需要 contents: write 才能创建/更新 Release 并上传产物
+permissions:
+  contents: write
+
+jobs:
+  build-desktop-windows:
+    # 对齐上游工作流，pin 到 windows-2022，避免 windows-latest 随镜像升级漂移
+    runs-on: windows-2022
+    # 以下三个环境变量对整个 job（含 pnpm install / postinstall）生效，缺一不可：
+    #   SKIP_LIB_COPY -> 命中 postinstall.ts 的首个分支，跳过 web-server rebuild
+    #   DESKTOP_ONLY  -> 让 postinstall.ts 只执行 `pnpm -F desktop install:deps`
+    #   IS_CI         -> 供 desktop/web-server 的 vite.config.ts 与 dependencies-patch.cjs 使用
+    # 关键：pnpm-workspace.yaml 中 allowBuilds.electron=false 禁用了 electron 自带 postinstall，
+    # 因此 Electron 二进制必须靠 postinstall.ts 里的 `pnpm -F desktop install:deps` 补下载。
+    env:
+      IS_CI: true
+      SKIP_LIB_COPY: true
+      DESKTOP_ONLY: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 与 root package.json 的 packageManager 字段保持一致
+          version: 10.34.5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          tag='${{ github.event.inputs.tag }}'
+          if [ -z "$tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag"
+
+      - name: Install dependencies
+        env:
+          # GitHub runner 访问 electron 官方下载源较慢，使用 npmmirror 镜像避免超时
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
+        run: pnpm install --frozen-lockfile
+
+      - name: Ensure Electron binary
+        env:
+          # 兜底：即使 postinstall 未按预期触发，也确保 Electron 发行版已下载
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+        run: pnpm -F desktop install:deps
+
+      - name: Build desktop
+        env:
+          ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
+        # 等价于 ts-node pack-desktop.ts && pnpm -F desktop pack:win:setup:x64
+        run: pnpm build:desktop
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          shopt -s nullglob
+          exes=(build/*.exe)
+          if [ ${#exes[@]} -eq 0 ]; then
+            echo "::error::未找到构建产物（build/*.exe），构建可能未产出安装包"
+            ls -la build || true
+            exit 1
+          fi
+          echo "找到构建产物："
+          printf '%s\n' "${exes[@]}"
+
+      - name: Upload artifacts (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows-${{ steps.tag.outputs.tag }}
+          path: |
+            build/*.exe
+            build/latest.yml
+          if-no-files-found: error
+
+      - name: Create / update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # 已存在则复用，不存在则创建（--target 仅在 tag 不存在时生效）
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes "Automatic desktop build for $TAG"
+          shopt -s nullglob
+          files=(build/*.exe)
+          if [ -f build/latest.yml ]; then
+            files+=(build/latest.yml)
+          fi
+          gh release upload "$TAG" "${files[@]}" --clobber
